@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# /abin/memtop - Per-node memory usage breakdown including processes, tmpfs mounts, cache, and kernel slab
+# /abin/memtop - Per-node memory usage breakdown including processes, tmpfs mounts, kernel allocations, and shmem
 
 set -euo pipefail
 
 format_bytes() {
-    local bytes=$1
+    local bytes=${1:-0}
     if (( bytes >= 1073741824 )); then
         printf "%6.1f GiB" "$(awk -v b="$bytes" 'BEGIN {print b/1073741824}')"
     elif (( bytes >= 1048576 )); then
@@ -23,11 +23,11 @@ for n in /sys/devices/system/node/node[0-9]*; do
     nodes+=("$(basename "$n" | sed 's/node//')")
 done
 
-echo "================================================================================================================"
-echo "                                           NUMA SYSTEM-WIDE OVERVIEW                                            "
-echo "================================================================================================================"
+echo "========================================================================================================================"
+echo "                                           NUMA SYSTEM-WIDE OVERVIEW                                                    "
+echo "========================================================================================================================"
 printf "%-12s | %-12s | %-12s | %-12s | %-12s | %-12s\n" "Node" "Size" "Free" "PageCache" "Slab (Kernel)" "Shmem (tmpfs)"
-echo "----------------------------------------------------------------------------------------------------------------"
+echo "========================================================================================================================"
 
 tot_sys_size=0
 tot_sys_free=0
@@ -35,14 +35,51 @@ tot_sys_page=0
 tot_sys_slab=0
 tot_sys_shmem=0
 
+declare -A node_sunreclaim
+declare -A node_pagetables
+declare -A node_kstack
+declare -A node_shmem_total
+declare -A node_free_mem
+declare -A node_active_file
+declare -A node_inactive_file
+declare -A node_sreclaimable
+
 for node_id in "${nodes[@]}"; do
     meminfo="/sys/devices/system/node/node${node_id}/meminfo"
     
-    total_kb=$(awk '/MemTotal:/ {print $4}' "$meminfo")
-    free_kb=$(awk '/MemFree:/ {print $4}' "$meminfo")
-    file_kb=$(awk '/FilePages:/ {print $4}' "$meminfo")
-    slab_kb=$(awk '/Slab:/ {print $4}' "$meminfo")
-    shmem_kb=$(awk '/Shmem:/ {print $4}' "$meminfo")
+    total_kb=$(awk '/MemTotal:/ {print $4; exit}' "$meminfo")
+    free_kb=$(awk '/MemFree:/ {print $4; exit}' "$meminfo")
+    file_kb=$(awk '/FilePages:/ {print $4; exit}' "$meminfo")
+    slab_kb=$(awk '/Slab:/ {print $4; exit}' "$meminfo")
+    shmem_kb=$(awk '/Shmem:/ {print $4; exit}' "$meminfo")
+    sunreclaim_kb=$(awk '/SUnreclaim:/ {print $4; exit}' "$meminfo")
+    sreclaim_kb=$(awk '/SReclaimable:/ {print $4; exit}' "$meminfo")
+    pt_kb=$(awk '/PageTables:/ {print $4; exit}' "$meminfo")
+    ks_kb=$(awk '/KernelStack:/ {print $4; exit}' "$meminfo")
+    act_file_kb=$(awk '/Active\(file\):/ {print $4; exit}' "$meminfo")
+    inact_file_kb=$(awk '/Inactive\(file\):/ {print $4; exit}' "$meminfo")
+    
+    # Sanitize inputs for bash arithmetic
+    total_kb=${total_kb:-0}
+    free_kb=${free_kb:-0}
+    file_kb=${file_kb:-0}
+    slab_kb=${slab_kb:-0}
+    shmem_kb=${shmem_kb:-0}
+    sunreclaim_kb=${sunreclaim_kb:-0}
+    sreclaim_kb=${sreclaim_kb:-0}
+    pt_kb=${pt_kb:-0}
+    ks_kb=${ks_kb:-0}
+    act_file_kb=${act_file_kb:-0}
+    inact_file_kb=${inact_file_kb:-0}
+
+    node_sunreclaim["$node_id"]=$((sunreclaim_kb * 1024))
+    node_pagetables["$node_id"]=$((pt_kb * 1024))
+    node_kstack["$node_id"]=$((ks_kb * 1024))
+    node_shmem_total["$node_id"]=$((shmem_kb * 1024))
+    node_free_mem["$node_id"]=$((free_kb * 1024))
+    node_sreclaimable["$node_id"]=$((sreclaim_kb * 1024))
+    node_active_file["$node_id"]=$((act_file_kb * 1024))
+    node_inactive_file["$node_id"]=$((inact_file_kb * 1024))
     
     tot_sys_size=$((tot_sys_size + total_kb * 1024))
     tot_sys_free=$((tot_sys_free + free_kb * 1024))
@@ -59,7 +96,7 @@ for node_id in "${nodes[@]}"; do
         "$(format_bytes $((shmem_kb * 1024)))"
 done
 
-echo "----------------------------------------------------------------------------------------------------------------"
+echo "========================================================================================================================"
 printf "%-12s | %-12s | %-12s | %-12s | %-12s | %-12s\n" \
     "TOTAL" \
     "$(format_bytes "$tot_sys_size")" \
@@ -69,13 +106,12 @@ printf "%-12s | %-12s | %-12s | %-12s | %-12s | %-12s\n" \
     "$(format_bytes "$tot_sys_shmem")"
 
 echo ""
-echo "================================================================================================================"
-echo "                                     PROCESS & TMPFS ALLOCATION PER NUMA NODE                                   "
-echo "================================================================================================================"
+echo "========================================================================================================================"
+echo "                                     PROCESS & TMPFS ALLOCATION PER NUMA NODE                                           "
+echo "========================================================================================================================"
 
-# Build table header based on active node IDs with 42-char wide Program column
-header_fmt="%-42s |"
-divider="-------------------------------------------+"
+header_fmt="%-55s |"
+divider="--------------------------------------------------------+"
 for nid in "${nodes[@]}"; do
     header_fmt="${header_fmt} %-12s |"
     divider="${divider}--------------+"
@@ -87,14 +123,43 @@ headers=("Program / Mount")
 for nid in "${nodes[@]}"; do
     headers+=("Node ${nid}")
 done
-headers+=("Total RAM")
+headers+=("Total RAM ↓")
 
 printf "$header_fmt" "${headers[@]}"
 echo "$divider"
 
-/usr/bin/awk -v node_list="${nodes[*]}" '
+# Pre-build special node metrics string to pass into awk
+special_metrics=""
+for nid in "${nodes[@]}"; do
+    sun=${node_sunreclaim[$nid]:-0}
+    pt=${node_pagetables[$nid]:-0}
+    ks=${node_kstack[$nid]:-0}
+    sh=${node_shmem_total[$nid]:-0}
+    fr=${node_free_mem[$nid]:-0}
+    sr=${node_sreclaimable[$nid]:-0}
+    af=${node_active_file[$nid]:-0}
+    inf=${node_inactive_file[$nid]:-0}
+    special_metrics="${special_metrics}${nid}:${sun}:${pt}:${ks}:${sh}:${fr}:${sr}:${af}:${inf} "
+done
+
+/usr/bin/awk -v node_list="${nodes[*]}" -v spec_data="$special_metrics" '
 BEGIN {
     split(node_list, active_nodes, " ");
+    
+    n_spec = split(spec_data, spec_arr, " ");
+    for (i = 1; i <= n_spec; i++) {
+        if (spec_arr[i] == "") continue;
+        split(spec_arr[i], parts, ":");
+        nid = parts[1];
+        sunreclaim[nid] = parts[2] + 0;
+        pagetables[nid] = parts[3] + 0;
+        kstack[nid] = parts[4] + 0;
+        shmem_tot[nid] = parts[5] + 0;
+        free_mem[nid] = parts[6] + 0;
+        sreclaim[nid] = parts[7] + 0;
+        act_file[nid] = parts[8] + 0;
+        inact_file[nid] = parts[9] + 0;
+    }
 }
 {
     cmd = $1;
@@ -105,6 +170,10 @@ BEGIN {
     proc_total[cmd] += pages;
     tot_pages += pages;
     node_tot[node] += pages;
+    
+    if (cmd ~ /^FS:/) {
+        fs_shmem[node] += (pages * 4096);
+    }
 }
 END {
     n = asorti(proc_total, sorted_procs, "@val_num_desc");
@@ -113,7 +182,7 @@ END {
         c = sorted_procs[i];
         if (proc_total[c] < 2560) continue; # Skip <10MB total
         
-        row_str = sprintf("%-42.42s |", c);
+        row_str = sprintf("%-55.55s |", c);
         for (j = 1; j <= length(active_nodes); j++) {
             nid = active_nodes[j];
             b = proc_pages[c, nid] * 4096;
@@ -124,9 +193,54 @@ END {
         print row_str;
     }
     
-    # Summary Totals Row
-    print "-------------------------------------------+--------------+--------------+--------------"
-    tot_str = sprintf("%-42s |", "TOTAL PROCESS & TMPFS RAM");
+    print "--------------------------------------------------------+--------------+--------------+--------------"
+    
+    # 1. Unmapped Shmem / IPC / GPU Buffers
+    unmapped_str = sprintf("%-55s |", "[SPECIAL] Unmapped Shmem / IPC / GPU");
+    unmapped_tot = 0;
+    for (j = 1; j <= length(active_nodes); j++) {
+        nid = active_nodes[j];
+        unmapped_b = shmem_tot[nid] - fs_shmem[nid];
+        if (unmapped_b < 0) unmapped_b = 0;
+        unmapped_str = unmapped_str sprintf(" %-12s |", format_b(unmapped_b));
+        unmapped_tot += unmapped_b;
+        node_tot[nid] += (unmapped_b / 4096);
+    }
+    tot_pages += (unmapped_tot / 4096);
+    unmapped_str = unmapped_str sprintf(" %-12s", format_b(unmapped_tot));
+    print unmapped_str;
+
+    # 2. Kernel Slab (Unreclaimable)
+    slab_str = sprintf("%-55s |", "[SPECIAL] Kernel Slab (Unreclaimable)");
+    slab_tot = 0;
+    for (j = 1; j <= length(active_nodes); j++) {
+        nid = active_nodes[j];
+        sb = sunreclaim[nid];
+        slab_str = slab_str sprintf(" %-12s |", format_b(sb));
+        slab_tot += sb;
+        node_tot[nid] += (sb / 4096);
+    }
+    tot_pages += (slab_tot / 4096);
+    slab_str = slab_str sprintf(" %-12s", format_b(slab_tot));
+    print slab_str;
+
+    # 3. Kernel Page Tables & Stacks
+    kmeta_str = sprintf("%-55s |", "[SPECIAL] Kernel PageTables & Stacks");
+    kmeta_tot = 0;
+    for (j = 1; j <= length(active_nodes); j++) {
+        nid = active_nodes[j];
+        kb = pagetables[nid] + kstack[nid];
+        kmeta_str = kmeta_str sprintf(" %-12s |", format_b(kb));
+        kmeta_tot += kb;
+        node_tot[nid] += (kb / 4096);
+    }
+    tot_pages += (kmeta_tot / 4096);
+    kmeta_str = kmeta_str sprintf(" %-12s", format_b(kmeta_tot));
+    print kmeta_str;
+
+    # Totals Row
+    print "--------------------------------------------------------+--------------+--------------+--------------"
+    tot_str = sprintf("%-55s |", "TOTAL ALLOCATED RAM (PROCESS + SPECIAL)");
     for (j = 1; j <= length(active_nodes); j++) {
         nid = active_nodes[j];
         b = node_tot[nid] * 4096;
@@ -134,6 +248,30 @@ END {
     }
     tot_str = tot_str sprintf(" %-12s", format_b(tot_pages * 4096));
     print tot_str;
+
+    # Free RAM Row
+    free_str = sprintf("%-55s |", "FREE RAM (UNALLOCATED)");
+    free_tot = 0;
+    for (j = 1; j <= length(active_nodes); j++) {
+        nid = active_nodes[j];
+        fb = free_mem[nid];
+        free_str = free_str sprintf(" %-12s |", format_b(fb));
+        free_tot += fb;
+    }
+    free_str = free_str sprintf(" %-12s", format_b(free_tot));
+    print free_str;
+
+    # Available RAM Row
+    avail_str = sprintf("%-55s |", "AVAILABLE RAM (FREE + RECLAIMABLE)");
+    avail_tot = 0;
+    for (j = 1; j <= length(active_nodes); j++) {
+        nid = active_nodes[j];
+        ab = free_mem[nid] + sreclaim[nid] + inact_file[nid] + int(act_file[nid] / 2);
+        avail_str = avail_str sprintf(" %-12s |", format_b(ab));
+        avail_tot += ab;
+    }
+    avail_str = avail_str sprintf(" %-12s", format_b(avail_tot));
+    print avail_str;
 }
 
 function format_b(bytes) {
@@ -144,10 +282,19 @@ function format_b(bytes) {
     return "       -    ";
 }
 ' <(
-    # 1. Parse process memory from /proc/*/numa_maps using comm/cmdline without truncation
     for pid_dir in /proc/[0-9]*; do
         [[ -f "$pid_dir/numa_maps" ]] || continue
-        cmd=$(/usr/bin/cat "$pid_dir/comm" 2>/dev/null || echo "unknown")
+        pid=$(basename "$pid_dir")
+        
+        raw_cmd=$(/usr/bin/cat "$pid_dir/cmdline" 2>/dev/null | tr '\0' ' ' | awk '{print $1}' || true)
+        
+        if [[ -n "$raw_cmd" ]]; then
+            cmd=$(basename "$raw_cmd")
+        else
+            cmd=$(/usr/bin/cat "$pid_dir/comm" 2>/dev/null || echo "unknown")
+        fi
+        
+        cmd="${cmd// /_}"
         
         /usr/bin/awk -v cmd="$cmd" '
             /N[0-9]+=/ {
@@ -163,16 +310,14 @@ function format_b(bytes) {
         ' "$pid_dir/numa_maps" 2>/dev/null
     done
 
-    # 2. Parse tmpfs RAM-disk mounts directly from /proc/mounts
     while read -r mnt; do
-        tmpfs_kb=$(/usr/bin/df -k "$mnt" 2>/dev/null | awk 'NR==2 {print $3}')
+        tmpfs_kb=$(/usr/bin/df -k "$mnt" 2>/dev/null | awk 'NR==2 {print $3}' || true)
         if [[ -n "$tmpfs_kb" && "$tmpfs_kb" -gt 10240 ]]; then
             pages_cnt=$((tmpfs_kb / 4))
             print_name="FS:${mnt}"
             
-            # Check if mount files belong mostly to node 1 or node 0 based on system shmem ratio
-            n0_shmem=$(awk '/Shmem:/ {print $4}' /sys/devices/system/node/node0/meminfo)
-            n1_shmem=$(awk '/Shmem:/ {print $4}' /sys/devices/system/node/node1/meminfo)
+            n0_shmem=$(awk '/Shmem:/ {print $4; exit}' /sys/devices/system/node/node0/meminfo 2>/dev/null || echo 0)
+            n1_shmem=$(awk '/Shmem:/ {print $4; exit}' /sys/devices/system/node/node1/meminfo 2>/dev/null || echo 0)
             
             if [[ "$n1_shmem" -gt "$n0_shmem" ]]; then
                 echo "$print_name" 1 "$pages_cnt"
