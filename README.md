@@ -1,8 +1,8 @@
 # install
 
-put it in your favourite bin dir
-chmod +x
-run with root to get complete overview
+ * put it in your favourite bin dir
+ * chmod +x
+ * run with root to get complete overview
 
 # EXAMPLE
 
